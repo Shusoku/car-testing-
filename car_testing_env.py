@@ -90,6 +90,29 @@ def bfs_path(grid: List[List[int]], start: Pos, goal: Pos, blocked: Set[Pos]) ->
     return None
 
 
+def choose_unblock_move(grid: List[List[int]], cur: Pos, occupied: Set[Pos], target: Optional[Pos]) -> Pos:
+    """Try to escape local blockades by preferring moves with more future options."""
+    options = [nxt for nxt in neighbors4(grid, cur[0], cur[1]) if nxt not in occupied]
+    if not options:
+        return cur
+
+    best = cur
+    best_score: Tuple[int, int, int] = (-1, -1, -10**9)
+    for nxt in options:
+        future_open = sum(1 for nn in neighbors4(grid, nxt[0], nxt[1]) if nn not in occupied or nn == cur)
+        blocked_next = set(occupied)
+        blocked_next.discard(cur)
+        path = bfs_path(grid, nxt, target, blocked_next) if target is not None else None
+        reachable = 1 if path else 0
+        # Prefer reachable moves; if unreachable, still prefer highest mobility.
+        target_bias = -len(path) if path else 0
+        score = (reachable, future_open, target_bias)
+        if score > best_score:
+            best_score = score
+            best = nxt
+    return best
+
+
 def random_road_cell(grid: List[List[int]], rng: random.Random, used: Set[Pos], candidates: Optional[List[Pos]] = None) -> Pos:
     source = candidates if candidates is not None else [(r, c) for r in range(GRID_H) for c in range(GRID_W)]
     roads = [(r, c) for r, c in source if grid[r][c] == ROAD and (r, c) not in used]
@@ -119,12 +142,24 @@ def generate_road_grid(rng: random.Random) -> Tuple[List[List[int]], Dict[str, o
     carve_hline(grid, center_row, 1, GRID_W - 2)
     carve_vline(grid, center_col, 1, GRID_H - 2)
 
-    # Shared off-road dead-end parking lot to the east.
-    final_intersection = (center_row, GRID_W - 7)
+    # Shared off-road parking lot to the east: one lane feeds into a 4x2 box.
+    final_intersection = (center_row, GRID_W - 8)
+    lot_left = GRID_W - 5
+    lot_right = GRID_W - 4
+    lot_top = center_row - 2
+    lot_bottom = center_row + 1
+
+    # Single approach lane from center to the lot entry.
     carve_hline(grid, center_row, center_col, final_intersection[1])
-    parking_cols = [GRID_W - 7, GRID_W - 6, GRID_W - 5, GRID_W - 4, GRID_W - 3]
-    for c in parking_cols:
-        grid[center_row][c] = ROAD
+    carve_hline(grid, center_row, final_intersection[1], lot_left)
+
+    # 4x2 parking box (4 rows x 2 cols), vertically stacked.
+    for r in range(lot_top, lot_bottom + 1):
+        for c in (lot_left, lot_right):
+            grid[r][c] = ROAD
+    # Internal connector between columns for easy parking flow.
+    for r in range(lot_top, lot_bottom + 1):
+        carve_hline(grid, r, lot_left, lot_right)
 
     # Add left-side streets for traffic variety, but avoid alternate lot access.
     for _ in range(4):
@@ -135,12 +170,17 @@ def generate_road_grid(rng: random.Random) -> Tuple[List[List[int]], Dict[str, o
         cc = rng.randint(2, center_col - 1)
         carve_vline(grid, cc, 2, GRID_H - 3)
 
-    # All goal slots are in a single line with the player's slot.
+    # Fill order is designed to avoid blocking access:
+    # first line (far/right column) top->bottom, then second line (left column).
     parking_slots: List[Pos] = [
-        (center_row, GRID_W - 4),  # player slot
-        (center_row, GRID_W - 5),
-        (center_row, GRID_W - 6),
-        (center_row, GRID_W - 3),
+        (center_row - 2, lot_right),  # player slot
+        (center_row - 1, lot_right),
+        (center_row, lot_right),
+        (center_row + 1, lot_right),
+        (center_row - 2, lot_left),
+        (center_row - 1, lot_left),
+        (center_row, lot_left),
+        (center_row + 1, lot_left),
     ]
 
     spawn_zone = [(r, c) for r in range(1, GRID_H - 1) for c in range(1, center_col) if grid[r][c] == ROAD]
@@ -156,7 +196,47 @@ def generate_road_grid(rng: random.Random) -> Tuple[List[List[int]], Dict[str, o
     }
 
 
-def step_ai_car(grid: List[List[int]], car: Car, all_positions: Set[Pos], god_mode: bool) -> Pos:
+def step_ai_car(
+    grid: List[List[int]],
+    car: Car,
+    all_positions: Set[Pos],
+    god_mode: bool,
+    intersection_center: Pos,
+) -> Pos:
+    if car.target == intersection_center:
+        # Center is never a valid parking target; force an unblock move instead.
+        return choose_unblock_move(grid, car.pos, all_positions, target=None)
+
+    if car.pos == intersection_center:
+        # If someone is queued around the center, clear the intersection quickly.
+        neighbors = neighbors4(grid, intersection_center[0], intersection_center[1])
+        pressure = any(n in all_positions and n != car.pos for n in neighbors)
+        if pressure:
+            exits = [n for n in neighbors if n not in all_positions]
+            if exits:
+                # Prefer stepping to the side (N/S) so through-lane traffic can pass.
+                exits.sort(key=lambda ex: (0 if ex[0] != intersection_center[0] else 1, abs(ex[1] - intersection_center[1])))
+                if car.target is not None:
+                    blocked = set(all_positions)
+                    blocked.discard(car.pos)
+                    scored: List[Tuple[int, Pos]] = []
+                    for ex in exits:
+                        path = bfs_path(grid, ex, car.target, blocked)
+                        scored.append((len(path) if path else 10**9, ex))
+                    scored.sort(key=lambda item: item[0])
+                    if scored[0][0] < 10**9:
+                        return scored[0][1]
+                return random.choice(exits)
+
+    if car.policy == "yield":
+        # A3 yield behavior: if traffic is lined up on the lane, step aside.
+        r, c = car.pos
+        center_row = GRID_H // 2
+        if r == center_row and ((r, c - 1) in all_positions or (r, c + 1) in all_positions):
+            for side in ((r - 1, c), (r + 1, c)):
+                if in_bounds(*side) and grid[side[0]][side[1]] == ROAD and side not in all_positions:
+                    return side
+
     if car.policy == "support":
         # Route-clearing behavior: pick a legal move that gets away from congestion.
         opts = [nxt for nxt in neighbors4(grid, car.pos[0], car.pos[1]) if nxt not in all_positions]
@@ -169,12 +249,7 @@ def step_ai_car(grid: List[List[int]], car: Car, all_positions: Set[Pos], god_mo
     # In optimized mode we keep the occasional random behavior for stress testing.
     # In god mode, use pure route solving every turn.
     if (car.move_tick % 3 == 0) and (not god_mode):
-        opts = list(neighbors4(grid, car.pos[0], car.pos[1]))
-        random.shuffle(opts)
-        for nxt in opts:
-            if nxt not in all_positions:
-                return nxt
-        return car.pos
+        return choose_unblock_move(grid, car.pos, all_positions, car.target)
 
     if car.target is None or car.pos == car.target:
         return car.pos
@@ -192,12 +267,7 @@ def step_ai_car(grid: List[List[int]], car: Car, all_positions: Set[Pos], god_mo
             return nxt
         return car.pos
 
-    opts = list(neighbors4(grid, car.pos[0], car.pos[1]))
-    random.shuffle(opts)
-    for nxt in opts:
-        if nxt not in all_positions:
-            return nxt
-    return car.pos
+    return choose_unblock_move(grid, car.pos, all_positions, car.target)
 
 
 def run() -> None:
@@ -207,14 +277,20 @@ def run() -> None:
     small = pygame.font.SysFont("consolas", 15)
     logical_w = GRID_W * CELL
     logical_h = GRID_H * CELL + 72
+    is_web = sys.platform == "emscripten"
 
-    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-    canvas = pygame.Surface((logical_w, logical_h))
+    if is_web:
+        screen = pygame.display.set_mode((logical_w, logical_h))
+        canvas = screen
+    else:
+        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        canvas = pygame.Surface((logical_w, logical_h))
     pygame.display.set_caption("Automated Car Testing Environment")
     clock = pygame.time.Clock()
 
     def reset_world() -> Tuple[List[List[int]], List[Car], str, deque[str], Dict[str, object]]:
         grid, layout = generate_road_grid(rng)
+        center = (GRID_H // 2, GRID_W // 2)
         used: Set[Pos] = set()
         cars: List[Car] = []
         player_goal: Pos = layout["player_goal"]  # type: ignore[assignment]
@@ -231,14 +307,18 @@ def run() -> None:
             p = random_road_cell(grid, rng, used, candidates=spawn_zone)
             used.add(p)
             is_support = i == (CARS_TOTAL - 2)
+            is_yield = i == 2 and not is_support  # This car is rendered as A3.
             t: Optional[Pos] = None if is_support else (ai_goals[i % len(ai_goals)] if ai_goals else player_goal)
+            if t == center:
+                non_center_slots = [slot for slot in parking_slots if slot != center]
+                t = non_center_slots[i % len(non_center_slots)] if non_center_slots else None
             cars.append(
                 Car(
                     pos=p,
                     target=t,
                     is_player=False,
                     color=AI_COLORS[i % len(AI_COLORS)],
-                    policy="support" if is_support else "bfs",
+                    policy="support" if is_support else ("yield" if is_yield else "bfs"),
                 )
             )
             if t is not None:
@@ -281,6 +361,15 @@ def run() -> None:
             "Close with X when done reviewing.",
         ]
         report_open = True
+
+    def refresh_live_report() -> None:
+        nonlocal report_lines
+        report_lines = [
+            "Live Incident Report",
+            f"Incidents so far: {incident_count}",
+            f"Mode: {ai_mode}",
+            "Press X to close/open this report.",
+        ]
 
     def approach_dir(pos: Pos) -> Optional[int]:
         r, c = pos
@@ -413,12 +502,31 @@ def run() -> None:
 
         all_positions = {c.pos for c in cars}
         for idx, car in enumerate(cars[1:], start=1):
-            next_pos = step_ai_car(grid, car, all_positions, god_mode=(ai_mode == "god"))
+            next_pos = step_ai_car(
+                grid,
+                car,
+                all_positions,
+                god_mode=(ai_mode == "god"),
+                intersection_center=intersection_center,
+            )
+            if car.pos == intersection_center:
+                # Hard center-clear rule: never hold center if any side/west exit is free.
+                if next_pos == car.pos:
+                    forced_exits = [
+                        (intersection_center[0] - 1, intersection_center[1]),  # north
+                        (intersection_center[0] + 1, intersection_center[1]),  # south
+                        (intersection_center[0], intersection_center[1] - 1),  # west
+                        (intersection_center[0], intersection_center[1] + 1),  # east fallback
+                    ]
+                    for ex in forced_exits:
+                        if in_bounds(*ex) and grid[ex[0]][ex[1]] == ROAD and ex not in all_positions:
+                            next_pos = ex
+                            break
             if car.policy == "support":
                 # Keep non-goal cars from clogging the final approach.
                 if next_pos in gate_zone or next_pos == final_intersection:
                     next_pos = car.pos
-            if not player_arrived() and car.policy == "bfs":
+            if car.pos != intersection_center and (not player_arrived()) and car.policy == "bfs":
                 # Reserve eastbound corridor for player until player reaches parking.
                 if car.pos[1] > intersection_center[1]:
                     next_pos = retreat_west_if_needed(car, all_positions)
@@ -450,7 +558,7 @@ def run() -> None:
                 running = False
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 logical_mouse = to_logical_pos(event.pos)
-                if accomplished and report_open and report_close_rect.collidepoint(logical_mouse):
+                if report_open and report_close_rect.collidepoint(logical_mouse):
                     report_open = False
             elif event.type == pygame.KEYDOWN:
                 moved = False
@@ -468,6 +576,13 @@ def run() -> None:
                 elif event.key in (pygame.K_g, pygame.K_m):
                     ai_mode = "god" if ai_mode == "optimized" else "optimized"
                     logs.append(f"AI mode -> {ai_mode}")
+                elif event.key == pygame.K_x:
+                    if report_open:
+                        report_open = False
+                    else:
+                        if not accomplished:
+                            refresh_live_report()
+                        report_open = True
                 elif event.key == pygame.K_SPACE and not accomplished:
                     if ai_mode == "god":
                         moved = step_player_god_mode()
@@ -535,7 +650,7 @@ def run() -> None:
         )
         canvas.blit(font.render(hud_text, True, (230, 232, 240)), (8, hud_y))
         canvas.blit(
-            small.render("Controls: WASD/Arrows move, Space stall, G god-mode, R reset", True, (190, 198, 214)),
+            small.render("Controls: WASD/Arrows move, Space stall, G god-mode, X report, R reset", True, (190, 198, 214)),
             (8, hud_y + 20),
         )
         if ai_mode == "god":
@@ -551,7 +666,7 @@ def run() -> None:
             offset = base_offset if accomplished else (base_offset - 16)
             canvas.blit(small.render(ln, True, (180, 190, 210)), (8, hud_y + offset + i * 16))
 
-        if accomplished and report_open:
+        if report_open:
             panel_w = GRID_W * CELL - 120
             panel_h = 300
             panel_x = 60
@@ -572,8 +687,9 @@ def run() -> None:
             for i, item in enumerate(recent):
                 canvas.blit(small.render(item, True, (195, 202, 218)), (panel.x + 14, panel.y + 148 + i * 18))
 
-        scaled = pygame.transform.smoothscale(canvas, screen.get_size())
-        screen.blit(scaled, (0, 0))
+        if canvas is not screen:
+            scaled = pygame.transform.smoothscale(canvas, screen.get_size())
+            screen.blit(scaled, (0, 0))
         pygame.display.flip()
 
     pygame.quit()

@@ -206,17 +206,11 @@ function show_infobox() {
 
         #infobox {
             position: fixed; /* center relative to viewport */
-            background: #0a8f3c;
-            color: #ffffff;
+            background: green;
+            color: blue;
             font-weight: bold;
-            font-size: 18px;
-            text-align: center;
-            border-radius: 12px;
-            border: 2px solid #065f28;
-            box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
-            padding: 16px 26px;
-            cursor: pointer;
-            user-select: none;
+            padding: 12px 24px;
+ /*           display: none; */
             z-index: 999999;
         }
         div.emscripten { text-align: center; }
@@ -394,27 +388,7 @@ frameborder="1"
         info.hidden = debug_hidden
         box.hidden =  debug_hidden
 
-        infobox.innerText = "Click here (or press Enter/Space) to start the simulator"
         show_infobox()
-
-        const startGame = () => {
-            infobox.style.display = "none";
-            if (typeof canvas !== "undefined") {
-                canvas.focus();
-            }
-            if (typeof window !== "undefined" && window.MM) {
-                // Hint to media engagement gate that user interacted.
-                window.MM.UME = true;
-            }
-        };
-
-        infobox.onclick = startGame;
-        canvas.addEventListener("click", startGame);
-        window.addEventListener("keydown", (ev) => {
-            if (ev.key === "Enter" || ev.key === " ") {
-                startGame();
-            }
-        });
     }
 
     function custom_prerun(){
