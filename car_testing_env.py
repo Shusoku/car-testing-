@@ -478,43 +478,51 @@ def run() -> None:
 
     def force_unstick_ai() -> bool:
         """Resolve prolonged stalls by nudging one AI to a safe alternate tile."""
-        occupied = {c.pos for c in cars}
+        nonlocal intersection_priority
+        nonlocal intersection_waiting
         cr, cc = intersection_center
         player_done = player_arrived()
 
-        candidates = [car for car in cars[1:] if car.policy in ("bfs", "yield")]
-        candidates.sort(key=lambda car: abs(car.pos[0] - cr) + abs(car.pos[1] - cc))
+        for policies in (("bfs", "yield"), ("support",)):
+            occupied = {c.pos for c in cars}
+            candidates = [car for car in cars[1:] if car.policy in policies]
+            candidates.sort(key=lambda car: abs(car.pos[0] - cr) + abs(car.pos[1] - cc))
 
-        for car in candidates:
-            options = [n for n in neighbors4(grid, car.pos[0], car.pos[1]) if n not in occupied]
-            if not options:
-                continue
-
-            ranked: List[Tuple[Tuple[int, int, int], Pos]] = []
-            for nxt in options:
-                if (not player_done) and nxt in gate_zone:
-                    continue
-                if nxt == final_intersection and car.policy == "support":
-                    continue
-                if not can_enter_intersection(car.pos, nxt, occupied):
+            for car in candidates:
+                options = [n for n in neighbors4(grid, car.pos[0], car.pos[1]) if n not in occupied]
+                if not options:
                     continue
 
-                future_open = sum(1 for nn in neighbors4(grid, nxt[0], nxt[1]) if nn not in occupied or nn == car.pos)
-                dist_center = abs(nxt[0] - cr) + abs(nxt[1] - cc)
-                west_bias = -nxt[1]
-                ranked.append(((future_open, dist_center, west_bias), nxt))
+                ranked: List[Tuple[Tuple[int, int, int], Pos]] = []
+                for nxt in options:
+                    if (not player_done) and nxt in gate_zone:
+                        continue
+                    if nxt == final_intersection and car.policy == "support":
+                        continue
+                    snap_p = intersection_priority
+                    snap_w = set(intersection_waiting)
+                    ok = can_enter_intersection(car.pos, nxt, occupied)
+                    intersection_priority = snap_p
+                    intersection_waiting = snap_w
+                    if not ok:
+                        continue
 
-            if not ranked:
-                continue
+                    future_open = sum(1 for nn in neighbors4(grid, nxt[0], nxt[1]) if nn not in occupied or nn == car.pos)
+                    dist_center = abs(nxt[0] - cr) + abs(nxt[1] - cc)
+                    west_bias = -nxt[1]
+                    ranked.append(((future_open, dist_center, west_bias), nxt))
 
-            ranked.sort(reverse=True)
-            chosen = ranked[0][1]
-            occupied.discard(car.pos)
-            occupied.add(chosen)
-            car.pos = chosen
-            cleanup_intersection_state()
-            logs.append("Anti-deadlock: nudged one AI car to restore traffic flow.")
-            return True
+                if not ranked:
+                    continue
+
+                ranked.sort(reverse=True)
+                chosen = ranked[0][1]
+                occupied.discard(car.pos)
+                occupied.add(chosen)
+                car.pos = chosen
+                cleanup_intersection_state()
+                logs.append("Anti-deadlock: nudged one AI car to restore traffic flow.")
+                return True
 
         return False
 
