@@ -445,6 +445,8 @@ def run() -> None:
         return True
 
     accomplished = False
+    stagnant_turns = 0
+    last_positions_key: Tuple[Pos, ...] = tuple(c.pos for c in cars)
 
     def all_cars_at_targets() -> bool:
         tracked = [car for car in cars if car.policy in ("player", "bfs")]
@@ -474,6 +476,48 @@ def run() -> None:
         ly = int(pos[1] * logical_h / sh)
         return lx, ly
 
+    def force_unstick_ai() -> bool:
+        """Resolve prolonged stalls by nudging one AI to a safe alternate tile."""
+        occupied = {c.pos for c in cars}
+        cr, cc = intersection_center
+        player_done = player_arrived()
+
+        candidates = [car for car in cars[1:] if car.policy in ("bfs", "yield")]
+        candidates.sort(key=lambda car: abs(car.pos[0] - cr) + abs(car.pos[1] - cc))
+
+        for car in candidates:
+            options = [n for n in neighbors4(grid, car.pos[0], car.pos[1]) if n not in occupied]
+            if not options:
+                continue
+
+            ranked: List[Tuple[Tuple[int, int, int], Pos]] = []
+            for nxt in options:
+                if (not player_done) and nxt in gate_zone:
+                    continue
+                if nxt == final_intersection and car.policy == "support":
+                    continue
+                if not can_enter_intersection(car.pos, nxt, occupied):
+                    continue
+
+                future_open = sum(1 for nn in neighbors4(grid, nxt[0], nxt[1]) if nn not in occupied or nn == car.pos)
+                dist_center = abs(nxt[0] - cr) + abs(nxt[1] - cc)
+                west_bias = -nxt[1]
+                ranked.append(((future_open, dist_center, west_bias), nxt))
+
+            if not ranked:
+                continue
+
+            ranked.sort(reverse=True)
+            chosen = ranked[0][1]
+            occupied.discard(car.pos)
+            occupied.add(chosen)
+            car.pos = chosen
+            cleanup_intersection_state()
+            logs.append("Anti-deadlock: nudged one AI car to restore traffic flow.")
+            return True
+
+        return False
+
     def step_player_god_mode() -> bool:
         player = cars[0]
         if player.target is None or player.pos == player.target:
@@ -498,10 +542,14 @@ def run() -> None:
     def run_turn(player_moved: bool) -> None:
         nonlocal ai_mode
         nonlocal accomplished
+        nonlocal stagnant_turns
+        nonlocal last_positions_key
         player = cars[0]
 
         all_positions = {c.pos for c in cars}
+        ai_moved = False
         for idx, car in enumerate(cars[1:], start=1):
+            prev_pos = car.pos
             next_pos = step_ai_car(
                 grid,
                 car,
@@ -542,9 +590,24 @@ def run() -> None:
             all_positions.discard(car.pos)
             all_positions.add(next_pos)
             car.pos = next_pos
+            if car.pos != prev_pos:
+                ai_moved = True
         cleanup_intersection_state()
         if not player_moved:
             logs.append("Stall turn: you skipped movement.")
+
+        current_key: Tuple[Pos, ...] = tuple(c.pos for c in cars)
+        if current_key == last_positions_key and (not player_moved) and (not ai_moved):
+            stagnant_turns += 1
+        else:
+            stagnant_turns = 0
+            last_positions_key = current_key
+
+        if stagnant_turns >= 5 and not accomplished:
+            if force_unstick_ai():
+                stagnant_turns = 0
+                last_positions_key = tuple(c.pos for c in cars)
+
         if all_cars_at_targets():
             accomplished = True
             logs.append("ACCOMPLISHED: all cars reached correct locations.")
@@ -567,6 +630,8 @@ def run() -> None:
                 elif event.key == pygame.K_r:
                     grid, cars, ai_mode, logs, layout = reset_world()
                     accomplished = False
+                    stagnant_turns = 0
+                    last_positions_key = tuple(c.pos for c in cars)
                     final_intersection = layout["final_intersection"]  # type: ignore[assignment]
                     gate_zone = set(layout["gate_zone"])  # type: ignore[arg-type]
                     intersection_priority = None
